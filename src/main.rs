@@ -8,7 +8,7 @@ mod splitscreen;
 use splitscreen::{Config, Compare, Input};
 
 fn main() {
-    let matches = App::new("splitscreen")
+    let matches = App::new("splitscreen-cli")
         .version(crate_version!())
         .setting(AppSettings::DeriveDisplayOrder)
         .setting(AppSettings::UnifiedHelpMessage)
