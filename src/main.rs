@@ -24,14 +24,6 @@ fn main() {
             .required(true)
             .value_name("FRAMERATE")
             .help("Set fps to FRAMERATE"))
-        .arg(Arg::with_name("cut-start")
-            .long("cut-start")
-            .value_name("SECONDS")
-            .help("Start video SECONDS seconds before the first split"))
-        .arg(Arg::with_name("cut-end")
-            .long("cut-end")
-            .value_name("SECONDS")
-            .help("End video SECONDS seconds after the last split"))
         .group(ArgGroup::with_name("cmp")
             .args(&["cmp-loss", "cmp-save"]))
         .arg(Arg::with_name("cmp-loss")
@@ -71,12 +63,6 @@ fn main() {
     let height = res_split[1].parse().unwrap();
 
     let fps = matches.value_of("fps").unwrap().parse().unwrap();
-
-    let cut_start = matches.value_of("cut-start")
-        .map(|s| s.parse().unwrap());
-
-    let cut_end = matches.value_of("cut-end")
-        .map(|s| s.parse().unwrap());
 
     let cmp =
         if matches.is_present("cmp-loss") {
@@ -128,7 +114,7 @@ fn main() {
 
 
     let config = Config {
-        width, height, fps, cut_start, cut_end, cmp, pause, inputs
+        width, height, fps, cmp, pause, inputs
     };
 
     eprintln!("{:#?}", config);

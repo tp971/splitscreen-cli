@@ -17,8 +17,6 @@ pub struct Config {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    pub cut_start: Option<f64>,
-    pub cut_end: Option<f64>,
     pub cmp: Option<Compare>,
     pub pause: f64,
     pub inputs: Vec<Input>
@@ -38,21 +36,22 @@ pub struct Input {
 
 #[derive(Debug, Clone)]
 pub struct RenderInfo {
-    pub start: usize,
-    pub length: usize,
+    pub start: u32,
+    pub length: u32,
     pub tiles: Vec<RenderTileInfo>,
-    pub pauses: Vec<usize>
+    pub pauses: Vec<u32>
 }
 
 #[derive(Debug, Clone)]
 pub struct RenderTileInfo {
     pub input: usize,
-    pub length: usize,
+    pub offset: u32,
+    pub length: u32,
     pub x: u32,
     pub y: u32,
     pub width: u32,
     pub height: u32,
-    pub splits: Vec<(usize, Option<usize>)>
+    pub splits: Vec<(u32, u32)>
 }
 
 
@@ -66,6 +65,9 @@ impl Config {
             if input.splits.len() != n_splits {
                 Err("inputs must have equal number of splits")?;
             }
+        }
+        if n_splits == 0 {
+            Err("inputs need at least one split")?;
         }
 
         let mut inputs = Vec::new();
@@ -90,21 +92,14 @@ impl Config {
             let height: u32 = lines[1].parse()?;
             let time: f64 = lines[2].parse()?;
 
-            inputs.push((width, height, time));
+            inputs.push((width, height, input.splits[0], time));
         }
-
-        let max_width = inputs.iter().map(|(w, _, _)| *w).max().unwrap();
-        let max_height = inputs.iter().map(|(_, h, _)| *h).max().unwrap();
 
         let tiles_x = (1..).filter(|i| i * i >= inputs.len()).next().unwrap() as u32;
         let tiles_y = (inputs.len() as u32 + tiles_x - 1) / tiles_x;
 
-        let scale_x = self.width as f64 / (tiles_x * max_width) as f64;
-        let scale_y = self.height as f64 / (tiles_y * max_height) as f64;
-        let scale = if scale_x <= scale_y { scale_x } else { scale_y };
-
-        let box_width = (scale * max_width as f64) as u32;
-        let box_height = (scale * max_height as f64) as u32;
+        let box_width = self.width / tiles_x;
+        let box_height = self.height / tiles_x;
 
         let tiles_off_x = self.width / 2 - tiles_x * box_width / 2;
         let tiles_off_y = self.height / 2 - tiles_y * box_height / 2;
@@ -117,18 +112,18 @@ impl Config {
             };
         let tiles_off_x_last = self.width / 2 - tiles_last_row * box_width / 2;
 
-        let cut_start = self.cut_start.map(|s| (s * self.fps as f64 + 0.5) as usize);
-        let cut_end = self.cut_end.map(|s| (s * self.fps as f64 + 0.5) as usize);
-        let pause = (self.pause * self.fps as f64 + 0.5) as usize;
-
-        let mut start = 0;
-
-        let mut length = 0;
+        let pause = (self.pause * self.fps as f64 + 0.5) as u32;
 
         let mut tiles: Vec<_> = inputs.into_iter().enumerate()
-            .map(|(i, (width, height, time))| {
-                let width = (scale * width as f64) as u32;
-                let height = (scale * height as f64) as u32;
+            .map(|(i, (width, height, first_split, time))| {
+                let (w1, h1) = (box_width, height * box_width / width);
+                let (w2, h2) = (width * box_height / height, box_height);
+                let (width, height) =
+                    if w1 <= box_width && h1 <= box_height {
+                        (w1, h1)
+                    } else {
+                        (w2, h2)
+                    };
 
                 let tx = i as u32 % tiles_x;
                 let ty = i as u32 / tiles_x;
@@ -140,9 +135,13 @@ impl Config {
                         tiles_off_x
                     };
 
+                let offset = first_split as u32 * self.fps;
+                let length = (time * self.fps as f64) as u32 - offset;
+
                 RenderTileInfo {
                     input: i,
-                    length: (time * self.fps as f64) as usize,
+                    offset,
+                    length,
                     x: tiles_off_x + tx * box_width + box_width / 2 - width / 2,
                     y: tiles_off_y + ty * box_height + box_height / 2 - height / 2,
                     width,
@@ -152,9 +151,11 @@ impl Config {
             })
             .collect();
 
+        let mut start = 0;
+        let mut length = 0;
         let mut pauses = Vec::new();
 
-        for i in 0..=n_splits {
+        for i in 0..n_splits {
             let mut t_max = 0;
             for tile in tiles.iter_mut() {
                 let input = &self.inputs[tile.input];
@@ -163,44 +164,21 @@ impl Config {
                     if i == 0 {
                         0
                     } else {
-                        (input.splits[i - 1] * self.fps as f64 + 0.5) as usize + 1
+                        (input.splits[i - 1] * self.fps as f64 + 0.5) as u32 - tile.offset + 1
                     };
-
-                let t_next =
-                    if i < n_splits {
-                        (input.splits[i] * self.fps as f64 + 0.5) as usize + 1
-                    } else {
-                        tile.length
-                    };
-
+                let t_next = (input.splits[i] * self.fps as f64 + 0.5) as u32 - tile.offset + 1;
                 let t_split = t_next - t_last;
 
-                if i < n_splits {
-                    tile.splits.push((length, Some(length + t_split)));
-                } else {
-                    tile.splits.push((length, None));
-                }
-
+                tile.splits.push((length, length + t_split));
                 t_max = t_max.max(t_split);
             }
-            if i < n_splits {
-                length += t_max;
-                if i == 0 {
-                    if let Some(cut_start) = cut_start {
-                        if cut_start < length {
-                            start = length - cut_start;
-                        }
-                    }
-                }
-                pauses.push(length);
-                length += pause;
-            } else {
-                if let Some(cut_end) = cut_end {
-                    length = (length + t_max).min(length + cut_end);
-                } else {
-                    length += t_max;
-                }
+
+            length += t_max;
+            if i == 0 {
+                start = length;
             }
+            pauses.push(length);
+            length += pause;
         }
 
         Ok(RenderInfo { start, length, tiles, pauses })
@@ -312,7 +290,7 @@ impl Config {
     }
 
     pub fn render<F>(&self, info: &RenderInfo, mut output: F) -> Result<(), Box<dyn Error>>
-        where F: FnMut((usize, Option<&RgbImage>)) -> Result<bool, Box<dyn Error>>
+        where F: FnMut((u32, Option<&RgbImage>)) -> Result<bool, Box<dyn Error>>
     {
         let ffmpeg = find_exec("ffmpeg").ok_or("ffmpeg not found")?;
 
@@ -327,6 +305,7 @@ impl Config {
         for tile in info.tiles.iter() {
             ffmpegs.push(Command::new(&ffmpeg)
                 .arg("-hwaccel").arg("auto")
+                .arg("-ss").arg(format_time(tile.offset as f64 / self.fps as f64))
                 .arg("-i").arg(&self.inputs[tile.input].video_path)
                 .arg("-c:v").arg("rawvideo")
                 .arg("-pix_fmt").arg("rgb24")
@@ -371,20 +350,13 @@ impl Config {
                     .filter(|(_, (start, _end))| *start <= frame_idx)
                     .last().unwrap();
 
-                let (active, first_end) =
-                    if let Some(end) = end {
-                        (frame_idx < end, frame_idx == end)
-                    } else {
-                        (true, false)
-                    };
-
                 let mut diff = None;
 
                 if frame_idx == start {
                     frame_cmp_start = None;
                 }
 
-                if active {
+                if frame_idx < end {
                     if let Ok(buf) = channel.recv() {
                         frame.copy_from(&buf, tile.x, tile.y).unwrap();
                     } else {
@@ -396,7 +368,7 @@ impl Config {
                     }
 
                 } else {
-                    if first_end {
+                    if frame_idx == end {
                         for y in tile.y..(tile.y + tile.height) {
                             for x in tile.x..(tile.x + tile.width) {
                                 let px = &mut frame[(x, y)];
@@ -421,7 +393,7 @@ impl Config {
                             },
                             Some(Compare::TimeSave) => {
                                 diff = Some((true,
-                                    frame_idx.min(info.pauses[split_idx]) - end.unwrap()));
+                                    frame_idx.min(info.pauses[split_idx]) - end));
                             },
                             _ => {}
                         }
@@ -429,8 +401,7 @@ impl Config {
                 }
 
                 if let Some(cmp_start) = frame_cmp_start {
-                    diff = Some((false,
-                        frame_idx.min(end.unwrap()) - cmp_start));
+                    diff = Some((false, frame_idx.min(end) - cmp_start));
                 }
 
                 if let Some((inv, diff)) = diff {
