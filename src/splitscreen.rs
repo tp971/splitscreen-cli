@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,15 @@ pub struct Config {
     pub cmp: Option<Compare>,
     pub pause: f64,
     pub inputs: Vec<Input>
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum Encoder {
+    X264,
+    VAAPI,
+    NVENC,
+    AMF,
+    QSV
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -202,30 +212,36 @@ impl Config {
         
         let res = self.render_raw(info, ffplay.stdin.take().unwrap(), false);
         if res.is_ok() {
-            ffplay.wait()?;
+            let exit = ffplay.wait()?;
+            if !exit.success() {
+                Err("ffplay exited abnormally")?;
+            }
         } else {
             ffplay.kill().ok();
         }
         res
     }
 
-    pub fn encode_to_stdout(&self, info: &RenderInfo, report: bool) -> Result<(), Box<dyn Error>> {
-        let mut ffmpeg = self.encode_command(report)?
+    pub fn encode_to_stdout(&self, info: &RenderInfo, encoder: Encoder, report: bool) -> Result<(), Box<dyn Error>> {
+        let mut ffmpeg = self.encode_command(encoder, report)?
             .arg("-")
             .stdout(Stdio::inherit())
             .spawn()?;
 
         let res = self.render_raw(info, ffmpeg.stdin.take().unwrap(), report);
         if res.is_ok() {
-            ffmpeg.wait()?;
+            let exit = ffmpeg.wait()?;
+            if !exit.success() {
+                Err("ffmpeg exited abnormally")?;
+            }
         } else {
             ffmpeg.kill().ok();
         }
         res
     }
 
-    pub fn encode_to_file(&self, info: &RenderInfo, output: &Path, report: bool) -> Result<(), Box<dyn Error>> {
-        let mut ffmpeg = self.encode_command(report)?
+    pub fn encode_to_file(&self, info: &RenderInfo, encoder: Encoder, report: bool, output: &Path) -> Result<(), Box<dyn Error>> {
+        let mut ffmpeg = self.encode_command(encoder, report)?
             .arg("-y")
             .arg(output)
             .stdout(Stdio::inherit())
@@ -233,14 +249,17 @@ impl Config {
 
         let res = self.render_raw(info, ffmpeg.stdin.take().unwrap(), report);
         if res.is_ok() {
-            ffmpeg.wait()?;
+            let exit = ffmpeg.wait()?;
+            if !exit.success() {
+                Err("ffmpeg exited abnormally")?;
+            }
         } else {
             ffmpeg.kill().ok();
         }
         res
     }
 
-    fn encode_command(&self, report: bool) -> Result<Command, Box<dyn Error>> {
+    fn encode_command(&self, encoder: Encoder, report: bool) -> Result<Command, Box<dyn Error>> {
         let ffmpeg = find_exec("ffmpeg").ok_or("ffmpeg not found")?;
 
         let mut cmd = Command::new(&ffmpeg);
@@ -250,16 +269,17 @@ impl Config {
             .arg("-video_size").arg(format!("{}x{}", self.width, self.height))
             .arg("-framerate").arg(format!("{}", self.fps))
             .arg("-i").arg("-")
-            .arg("-c:v").arg("libx264")
-            .arg("-crf").arg("23")
-            .arg("-f").arg("mp4")
-            .stdin(Stdio::piped());
+            .arg("-f").arg("mp4");
 
+        encoder.apply_args(&mut cmd);
+
+        cmd.stdin(Stdio::piped());
         if report {
             cmd.stderr(Stdio::null());
         } else {
             cmd.stderr(Stdio::inherit());
         }
+        eprintln!("{:?}", cmd);
 
         Ok(cmd)
     }
@@ -464,6 +484,63 @@ impl Config {
 
 
 
+impl Encoder {
+    pub fn all() -> Vec<Encoder> {
+        vec![
+            Encoder::X264,
+            Encoder::VAAPI,
+            Encoder::NVENC,
+            Encoder::AMF,
+            Encoder::QSV
+        ]
+    }
+
+    pub fn apply_args(&self, cmd: &mut Command) {
+        match self {
+            Encoder::X264 => {
+                cmd
+                    .arg("-c:v").arg("libx264")
+                    .arg("-crf").arg("23");
+            },
+            Encoder::VAAPI => {
+                cmd
+                    .arg("-vaapi_device").arg("/dev/dri/renderD128")
+                    .arg("-vf").arg("format=nv12,hwupload")
+                    .arg("-c:v").arg("h264_vaapi")
+                    .arg("-qp").arg("23");
+            },
+            Encoder::NVENC => {
+                cmd
+                    .arg("-c:v").arg("h264_nvenc")
+                    .arg("-qp").arg("23");
+            },
+            Encoder::AMF => {
+                unimplemented!() //TODO
+            },
+            Encoder::QSV => {
+                unimplemented!() //TODO
+            }
+        }
+    }
+}
+
+impl fmt::Display for Encoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Encoder::X264 =>
+                write!(f, "x264"),
+            Encoder::VAAPI =>
+                write!(f, "vaapi"),
+            Encoder::NVENC =>
+                write!(f, "nvenc"),
+            Encoder::AMF =>
+                write!(f, "amf"),
+            Encoder::QSV =>
+                write!(f, "qsv")
+        }
+    }
+}
+
 impl Input {
     pub fn new(video_path: &Path) -> Input {
         Input {
@@ -473,7 +550,8 @@ impl Input {
     }
 
     pub fn from_file(video_path: &Path, path: &Path) -> Result<Input, Box<dyn Error>> {
-        let file = File::open(path)?;
+        let file = File::open(path)
+            .map_err(|e| format!("cannot open {}: {}", video_path.display(), e))?;
         let reader = BufReader::new(file);
         let lines: Vec<_> = reader.lines()
             .collect::<Result<_, _>>()?;

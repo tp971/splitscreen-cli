@@ -1,68 +1,110 @@
 use std::env;
+use std::error::Error;
 use std::io;
 use std::path::Path;
+use std::process;
 
-use clap::{App, AppSettings, Arg, ArgGroup, crate_version};
+use clap::{AppSettings, Arg, ArgGroup, Command, crate_version};
 
 mod splitscreen;
-use splitscreen::{Config, Compare, Input};
+use splitscreen::{Config, Compare, Encoder, Input};
 
 fn main() {
-    let matches = App::new("splitscreen-cli")
+    if let Err(err) = run() {
+        eprintln!("error: {}", err);
+        process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let matches = Command::new("splitscreen-cli")
         .version(crate_version!())
         .setting(AppSettings::DeriveDisplayOrder)
-        .setting(AppSettings::UnifiedHelpMessage)
-        .arg(Arg::with_name("resolution")
+
+        .arg(Arg::new("resolution")
             .long("res")
-            .short("r")
+            .short('s')
             .required(true)
             .value_name("WIDTHxHEIGHT")
             .help("Set resolution to WIDTHxHEIGHT"))
-        .arg(Arg::with_name("fps")
+
+        .arg(Arg::new("fps")
             .long("fps")
-            .short("R")
+            .short('r')
             .required(true)
-            .value_name("FRAMERATE")
-            .help("Set fps to FRAMERATE"))
-        .group(ArgGroup::with_name("cmp")
+            .value_name("FPS")
+            .help("Set frame rate to FPS"))
+
+        .group(ArgGroup::new("cmp-type")
             .args(&["cmp-loss", "cmp-save"]))
-        .arg(Arg::with_name("cmp-loss")
+        .arg(Arg::new("cmp-loss")
             .long("cmp-loss")
             .help("Compare time loss"))
-        .arg(Arg::with_name("cmp-save")
+        .arg(Arg::new("cmp-save")
             .long("cmp-save")
             .help("Compare time save"))
-        .arg(Arg::with_name("pause")
+
+        .arg(Arg::new("pause")
             .long("pause")
-            .short("p")
+            .short('p')
             .value_name("SECONDS")
             .help("Pause for SECONDS seconds after each split"))
-        .arg(Arg::with_name("output")
+
+        .arg(Arg::new("output")
             .long("out")
-            .short("o")
+            .short('o')
             .value_name("FILENAME")
             .help("Render video into FILENAME"))
-        .arg(Arg::with_name("raw")
+
+        .arg(Arg::new("encoder")
+            .long("encoder")
+            .short('e')
+            .value_name("ENCODER")
+            .help("Use ENCODER for video encoding (one of x264 (default), vaapi, nvenc, amf, qsv)"))
+
+        .arg(Arg::new("raw")
             .long("raw")
             .help("Output rawvideo"))
-        .arg(Arg::with_name("report")
+
+        .arg(Arg::new("report")
             .long("report")
             .help("Report progress to stderr"))
-        .arg(Arg::with_name("input")
+
+        .group(ArgGroup::new("input-type")
+            .args(&["input-files", "input-args"]))
+        .arg(Arg::new("input-files")
+            .long("input-files")
+            .short('F')
+            .help("Interpret INPUT as pairs of video and split files, i.e. INPUT = video1 splitfile1 video2 splifile2 ... (this is the default behavior)"))
+        .arg(Arg::new("input-args")
+            .long("input-args")
+            .short('A')
+            .help("Interpret INPUT as video files combined with arguments, seperated by `--`, i.e. INPUT = video1 arg arg ... -- video2 arg arg ... -- ..."))
+
+        .arg(Arg::new("input")
             .index(1)
-            .multiple(true)
+            .multiple_occurrences(true)
             .required(true)
             .value_name("INPUT")
             .help("Input (see above)"))
+
         .get_matches();
+
+    let encoders = Encoder::all();
 
     let res = matches.value_of("resolution").unwrap();
     let res_split: Vec<_> = res.split("x").collect();
-    assert!(res_split.len() == 2);
-    let width = res_split[0].parse().unwrap();
-    let height = res_split[1].parse().unwrap();
+    if res_split.len() != 2 {
+        Err(format!("invalid resolution: {}", res))?;
+    }
+    let width = res_split[0].parse()
+        .map_err(|_| format!("invalid resolution: {}", res))?;
+    let height = res_split[1].parse()
+        .map_err(|_| format!("invalid resolution: {}", res))?;
 
-    let fps = matches.value_of("fps").unwrap().parse().unwrap();
+    let fps_str = matches.value_of("fps").unwrap();
+    let fps = fps_str.parse()
+        .map_err(|_| format!("invalid frame rate: {}", fps_str))?;
 
     let cmp =
         if matches.is_present("cmp-loss") {
@@ -73,10 +115,23 @@ fn main() {
             None
         };
 
-    let pause = matches.value_of("pause")
-        .map_or(0.0, |s| s.parse().unwrap());
+    let pause =
+        if let Some(s) = matches.value_of("pause") {
+            s.parse().map_err(|_| format!("invalid number: {}", s))?
+        } else {
+            0.0
+        };
 
     let output = matches.value_of("output");
+
+    let encoder =
+        if let Some(val) = matches.value_of("encoder") {
+            *encoders.iter()
+                .find(|e| e.to_string() == val)
+                .ok_or_else(|| format!("unknown encoder: {}", val))?
+        } else {
+            Encoder::X264
+        };
 
     let raw = matches.is_present("raw");
 
@@ -85,29 +140,27 @@ fn main() {
 
 
     let mut inputs = Vec::new();
-    let mut it = matches.values_of("input").unwrap();
-    while let Some(video_path) = it.next() {
-        if video_path == "--" {
-            continue;
-        }
-        let video_path = Path::new(video_path);
-
-        if let Some(arg0) = it.next() {
-            if let Some(input_file) = arg0.strip_prefix("@") {
-                inputs.push(Input::from_file(video_path,
-                    Path::new(input_file)).unwrap());
-            } else if arg0 == "--" {
-                eprintln!("warning: missing arguments for video file: {:?}", video_path);
-                inputs.push(Input::new(video_path));
-            } else {
-                let mut args = vec![arg0];
-                args.extend(it.by_ref().take_while(|s| *s != "--"));
-                inputs.push(Input::from_args(video_path,
-                    args.into_iter()).unwrap());
+    if matches.is_present("input-args") {
+        let mut it = matches.values_of("input").unwrap();
+        while let Some(video_path) = it.next() {
+            if video_path == "--" {
+                continue;
             }
-        } else {
-            eprintln!("warning: missing arguments for video file: {:?}", video_path);
-            inputs.push(Input::new(video_path));
+            let video_path = Path::new(video_path);
+            let args = it.by_ref().take_while(|s| *s != "--");
+            let input = Input::from_args(video_path, args.into_iter())?;
+            inputs.push(input);
+        }
+    } else {
+        let mut it = matches.values_of("input").unwrap();
+        while let Some(video_path) = it.next() {
+            let video_path = Path::new(video_path);
+            if let Some(split_file) = it.next() {
+                let input = Input::from_file(video_path, Path::new(split_file))?;
+                inputs.push(input);
+            } else {
+                Err(format!("error: missing split file for video: {:?}", video_path))?;
+            }
         }
     }
 
@@ -119,26 +172,28 @@ fn main() {
 
     eprintln!("{:#?}", config);
 
-    let info = config.prepare().unwrap();
+    let info = config.prepare()?;
 
     eprintln!("{:#?}", info);
     
     if let Some(name) = output {
         if raw {
             if name == "-" {
-                config.render_raw(&info, io::stdout(), report).unwrap();
+                config.render_raw(&info, io::stdout(), report)?;
             } else {
-                config.render_raw_to_file(&info, Path::new(name), report).unwrap();
+                config.render_raw_to_file(&info, Path::new(name), report)?;
             }
         } else {
             if name == "-" {
-                config.encode_to_stdout(&info, report).unwrap();
+                config.encode_to_stdout(&info, encoder, report)?;
             } else {
-                config.encode_to_file(&info, Path::new(name), report).unwrap();
+                config.encode_to_file(&info, encoder, report, Path::new(name))?;
             }
         }
 
     } else {
-        config.play(&info).unwrap();
+        config.play(&info)?;
     }
+
+    Ok(())
 }
