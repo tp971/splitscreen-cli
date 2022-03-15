@@ -23,7 +23,7 @@ pub struct Config {
     pub inputs: Vec<Input>
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Encoder {
     X264,
     VAAPI,
@@ -495,6 +495,21 @@ impl Encoder {
         ]
     }
 
+    pub fn desc(&self) -> &'static str {
+        match self {
+            Encoder::X264 =>
+                "CPU encoder",
+            Encoder::VAAPI =>
+                "Linux VAAPI encoder",
+            Encoder::NVENC =>
+                "NVIDIA GPU encoder",
+            Encoder::AMF =>
+                "AMD GPU encoder",
+            Encoder::QSV =>
+                "Intel GPU encoder"
+        }
+    }
+
     pub fn apply_args(&self, cmd: &mut Command) {
         match self {
             Encoder::X264 => {
@@ -521,6 +536,12 @@ impl Encoder {
                 unimplemented!() //TODO
             }
         }
+    }
+}
+
+impl Default for Encoder {
+    fn default() -> Encoder {
+        Encoder::X264
     }
 }
 
